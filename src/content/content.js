@@ -6,9 +6,9 @@
   }
   window.__DiggAIInstalled = true;
 
-  var PANEL_VERSION = "0.6.0";
-  var GITHUB_COMMIT = "59b7eb3";
-  var STORAGE_KEY = "diggAI.state.v0.6.0";
+  var PANEL_VERSION = "0.6.1";
+  var GITHUB_COMMIT = "0542d9c";
+  var STORAGE_KEY = "diggAI.state.v0.6.1";
   var DEFAULT_STATE = {
     originalQuestion: "",
     latestAnswer: "",
@@ -1125,6 +1125,7 @@
     adapter = new ChatGPTDomAdapter(root);
     bindUiEvents();
     await restoreState();
+    state.logLines = [];
     syncUiFromState();
     setPanelVisible(false);
     appendLog("插件已加载。");

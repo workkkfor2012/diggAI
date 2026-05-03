@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "0.6.0";
+  var VERSION = "0.6.1";
   var CONVERGED_PATTERN = /^\s*局部收敛\s*[:：]\s*是\s*$/m;
 
   function normalizeText(value) {
