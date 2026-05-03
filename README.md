@@ -1,6 +1,6 @@
-# DiggAI v0.5.2
+# DiggAI v0.6.0
 
-DiggAI 是一个纯 Firefox WebExtension，会在 `chatgpt.com` 和 `chat.openai.com` 页面右侧注入控制面板，用于围绕原始问题 A 和最新回答 B/C/D 进行迭代收敛追问。
+DiggAI 是一个纯 Firefox WebExtension，会在 `chatgpt.com` 和 `chat.openai.com` 页面右侧注入控制面板，用于从原始提示词 A 一键开始自动迭代追问。
 
 ## 文件结构
 
@@ -17,6 +17,19 @@ F:\work\github\diggAI
   scripts\
     install-to-f-drive.ps1
 ```
+
+## 使用方式
+
+1. 打开 `https://chatgpt.com/`
+2. 在 DiggAI 面板的“原始提示词 A”里输入第一次问题
+3. 设置最大迭代轮数
+4. 可选填写自定义追加字符串
+5. 点击“开始迭代”
+6. 插件会自动发送 A，并继续基于最新回答追问，直到达到轮数或检测到“局部收敛：是”
+
+## 调试区
+
+高级调试区里的“捕获 A+B”“仅捕获最新回答”“生成下一轮 Prompt”“填入输入框”仅用于页面异常时手动排查，不是正常使用流程。
 
 ## 临时加载
 

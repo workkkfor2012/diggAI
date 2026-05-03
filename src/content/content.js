@@ -6,15 +6,15 @@
   }
   window.__DiggAIInstalled = true;
 
-  var PANEL_VERSION = "0.5.2";
-  var STORAGE_KEY = "diggAI.state.v0.5.2";
+  var PANEL_VERSION = "0.6.0";
+  var STORAGE_KEY = "diggAI.state.v0.6.0";
   var DEFAULT_STATE = {
     originalQuestion: "",
     latestAnswer: "",
     answerIndex: 0,
     nextPrompt: "",
     customSuffix: "",
-    maxRounds: 3,
+    maxRounds: 5,
     stopOnConverged: true,
     stableMs: 2800,
     timeoutMs: 180000,
@@ -217,9 +217,9 @@
     state.latestAnswer = normalizeText(ui.latestAnswer.value);
     state.customSuffix = normalizeText(ui.customSuffix.value);
     state.nextPrompt = normalizeText(ui.nextPrompt.value);
-    state.maxRounds = toPositiveInt(ui.maxRounds.value, DEFAULT_STATE.maxRounds) || 1;
-    state.stableMs = toPositiveInt(ui.stableMs.value, DEFAULT_STATE.stableMs) || DEFAULT_STATE.stableMs;
-    state.timeoutMs = toPositiveInt(ui.timeoutMs.value, DEFAULT_STATE.timeoutMs) || DEFAULT_STATE.timeoutMs;
+    state.maxRounds = Math.max(1, toPositiveInt(ui.maxRounds.value, DEFAULT_STATE.maxRounds) || DEFAULT_STATE.maxRounds);
+    state.stableMs = Math.max(100, toPositiveInt(ui.stableMs.value, DEFAULT_STATE.stableMs) || DEFAULT_STATE.stableMs);
+    state.timeoutMs = Math.max(1000, toPositiveInt(ui.timeoutMs.value, DEFAULT_STATE.timeoutMs) || DEFAULT_STATE.timeoutMs);
     state.stopOnConverged = Boolean(ui.stopOnConverged.checked);
   }
 
@@ -242,21 +242,31 @@
   }
 
   function updateButtonStates() {
-    if (!ui.startLoop) {
+    if (!ui.startFromA) {
       return;
     }
 
-    ui.startLoop.disabled = isRunning;
+    ui.startFromA.disabled = isRunning;
     ui.stop.disabled = !isRunning;
-    ui.sendOne.disabled = isRunning;
+
+    if (ui.captureAB) {
+      ui.captureAB.disabled = isRunning;
+    }
+    if (ui.captureLatest) {
+      ui.captureLatest.disabled = isRunning;
+    }
+    if (ui.generate) {
+      ui.generate.disabled = isRunning;
+    }
+    if (ui.fill) {
+      ui.fill.disabled = isRunning;
+    }
   }
 
   function setFieldValue(element, value) {
-    if (!element) {
-      return;
+    if (element) {
+      element.value = value;
     }
-
-    element.value = value;
   }
 
   function createLabeledBlock(labelText, control) {
@@ -283,12 +293,7 @@
       '    <div class="diggai-status" data-role="status">状态：idle</div>',
       "  </div>",
       '  <div class="diggai-actions">',
-      '    <button type="button" data-action="capture-ab">捕获 A+B</button>',
-      '    <button type="button" data-action="capture-latest">仅捕获最新回答</button>',
-      '    <button type="button" data-action="generate">生成下一轮 Prompt</button>',
-      '    <button type="button" data-action="fill">填入输入框</button>',
-      '    <button type="button" data-action="send-one">发送一轮</button>',
-      '    <button type="button" data-action="start-loop">开始连续迭代</button>',
+      '    <button type="button" data-action="start-from-a">开始迭代</button>',
       '    <button type="button" data-action="stop">停止</button>',
       "  </div>",
       '  <div class="diggai-body"></div>',
@@ -299,21 +304,24 @@
 
     var body = root.querySelector(".diggai-body");
     var originalQuestion = document.createElement("textarea");
-    var latestAnswer = document.createElement("textarea");
     var customSuffix = document.createElement("textarea");
     var maxRounds = document.createElement("input");
     var stableMs = document.createElement("input");
     var timeoutMs = document.createElement("input");
     var stopOnConverged = document.createElement("input");
+    var latestAnswer = document.createElement("textarea");
     var nextPrompt = document.createElement("textarea");
     var logLines = document.createElement("textarea");
+    var debugDetails = document.createElement("details");
+    var debugSummary = document.createElement("summary");
+    var debugBody = document.createElement("div");
+    var debugActions = document.createElement("div");
 
     originalQuestion.rows = 4;
-    latestAnswer.rows = 6;
     customSuffix.rows = 3;
+    latestAnswer.rows = 6;
     nextPrompt.rows = 8;
     logLines.rows = 8;
-    logLines.readOnly = true;
 
     maxRounds.type = "number";
     maxRounds.min = "1";
@@ -323,10 +331,11 @@
     timeoutMs.min = "1000";
     stopOnConverged.type = "checkbox";
 
-    body.appendChild(createLabeledBlock("原始问题 A", originalQuestion));
-    body.appendChild(createLabeledBlock("上一轮 / 最新回答", latestAnswer));
+    logLines.readOnly = true;
+
+    body.appendChild(createLabeledBlock("原始提示词 A", originalQuestion));
     body.appendChild(createLabeledBlock("自定义追加字符串", customSuffix));
-    body.appendChild(createLabeledBlock("连续迭代轮数", maxRounds));
+    body.appendChild(createLabeledBlock("最大迭代轮数", maxRounds));
     body.appendChild(createLabeledBlock("稳定等待 ms", stableMs));
     body.appendChild(createLabeledBlock("单轮超时 ms", timeoutMs));
 
@@ -334,23 +343,41 @@
     var checkboxTitle = document.createElement("span");
     checkboxWrapper.className = "diggai-field diggai-checkbox";
     checkboxTitle.className = "diggai-label";
-    checkboxTitle.textContent = "是否检测“局部收敛：是”后停止";
+    checkboxTitle.textContent = "检测到独立行“局部收敛：是”后停止";
     checkboxWrapper.appendChild(checkboxTitle);
     checkboxWrapper.appendChild(stopOnConverged);
     body.appendChild(checkboxWrapper);
 
-    body.appendChild(createLabeledBlock("下一轮 Prompt 预览", nextPrompt));
     body.appendChild(createLabeledBlock("运行日志", logLines));
+
+    debugDetails.className = "diggai-debug";
+    debugSummary.className = "diggai-debug-summary";
+    debugSummary.textContent = "高级调试区";
+    debugBody.className = "diggai-debug-body";
+    debugActions.className = "diggai-debug-actions";
+
+    debugActions.innerHTML = [
+      '<button type="button" data-action="capture-ab">捕获 A+B</button>',
+      '<button type="button" data-action="capture-latest">仅捕获最新回答</button>',
+      '<button type="button" data-action="generate">生成下一轮 Prompt</button>',
+      '<button type="button" data-action="fill">填入输入框</button>'
+    ].join("");
+
+    debugBody.appendChild(createLabeledBlock("最新回答", latestAnswer));
+    debugBody.appendChild(createLabeledBlock("下一轮 Prompt 预览", nextPrompt));
+    debugBody.appendChild(debugActions);
+    debugDetails.appendChild(debugSummary);
+    debugDetails.appendChild(debugBody);
+    body.appendChild(debugDetails);
 
     ui = {
       status: root.querySelector('[data-role="status"]'),
-      captureAB: root.querySelector('[data-action="capture-ab"]'),
-      captureLatest: root.querySelector('[data-action="capture-latest"]'),
-      generate: root.querySelector('[data-action="generate"]'),
-      fill: root.querySelector('[data-action="fill"]'),
-      sendOne: root.querySelector('[data-action="send-one"]'),
-      startLoop: root.querySelector('[data-action="start-loop"]'),
+      startFromA: root.querySelector('[data-action="start-from-a"]'),
       stop: root.querySelector('[data-action="stop"]'),
+      captureAB: debugActions.querySelector('[data-action="capture-ab"]'),
+      captureLatest: debugActions.querySelector('[data-action="capture-latest"]'),
+      generate: debugActions.querySelector('[data-action="generate"]'),
+      fill: debugActions.querySelector('[data-action="fill"]'),
       originalQuestion: originalQuestion,
       latestAnswer: latestAnswer,
       customSuffix: customSuffix,
@@ -384,6 +411,17 @@
       });
     });
 
+    ui.startFromA.addEventListener("click", function () {
+      void guardedAction(startFromOriginalQuestion);
+    });
+    ui.stop.addEventListener("click", function () {
+      abortRequested = true;
+      appendLog("已请求停止。");
+
+      if (!isRunning) {
+        setStatus("stopped");
+      }
+    });
     ui.captureAB.addEventListener("click", function () {
       void guardedAction(captureAB);
     });
@@ -395,19 +433,6 @@
     });
     ui.fill.addEventListener("click", function () {
       void guardedAction(fillComposerFromPreview);
-    });
-    ui.sendOne.addEventListener("click", function () {
-      void guardedAction(sendOneRound);
-    });
-    ui.startLoop.addEventListener("click", function () {
-      void guardedAction(startContinuousIteration);
-    });
-    ui.stop.addEventListener("click", function () {
-      abortRequested = true;
-      if (!isRunning) {
-        setStatus("stopped");
-        appendLog("用户已停止");
-      }
     });
   }
 
@@ -422,11 +447,12 @@
 
     if (message === "用户已停止。") {
       setStatus("stopped");
-      appendLog("用户已停止");
-    } else {
-      setStatus("error");
-      appendLog(message, true);
+      appendLog("用户已停止。");
+      return;
     }
+
+    setStatus("error");
+    appendLog("错误：" + message, true);
   }
 
   function buildPromptFromState() {
@@ -438,8 +464,8 @@
       customSuffix: state.customSuffix
     });
     setFieldValue(ui.nextPrompt, state.nextPrompt);
-    setStatus("prompt_ready");
-    appendLog("已生成下一轮 Prompt");
+    setStatus("building_followup");
+    appendLog("已生成下一轮 Prompt。");
     void persistState();
     return state.nextPrompt;
   }
@@ -460,9 +486,9 @@
     state.latestAnswer = assistantText;
     state.answerIndex = 1;
     state.nextPrompt = "";
-    setStatus("captured");
+    setStatus("captured_b");
     syncUiFromState();
-    appendLog("已捕获 A+B");
+    appendLog("已捕获 A+B。");
     await persistState();
   }
 
@@ -481,9 +507,9 @@
 
     state.latestAnswer = assistantText;
     state.nextPrompt = "";
-    setStatus("captured");
+    setStatus("captured_next_answer");
     syncUiFromState();
-    appendLog("已捕获最新回答");
+    appendLog("已捕获最新回答。");
     await persistState();
   }
 
@@ -502,95 +528,139 @@
 
     adapter.fillComposer(state.nextPrompt);
     setStatus("filling");
-    appendLog("已填入输入框");
+    appendLog("已填入输入框。");
     await persistState();
   }
 
-  async function executeRound() {
+  async function sendRawPromptAndCapture(promptText) {
     checkAbort();
-    buildPromptFromState();
-    adapter.fillComposer(state.nextPrompt);
+
+    var prompt = normalizeText(promptText);
+    var beforeSnapshot = null;
+    var answer = "";
+    var isFirstRound = state.answerIndex === 0;
+
+    if (!prompt) {
+      throw new Error("待发送 Prompt 为空。");
+    }
+
+    beforeSnapshot = adapter.getAssistantSnapshot();
+
     setStatus("filling");
-    appendLog("已填入输入框");
+    adapter.fillComposer(prompt);
+    appendLog("已填入 ChatGPT 输入框。");
+
     await sleep(150);
     checkAbort();
 
-    var beforeSnapshot = adapter.getAssistantSnapshot();
-
-    setStatus("sending");
+    setStatus(isFirstRound ? "sending_original_a" : "sending_followup");
     await adapter.clickSend();
-    appendLog("已点击发送，等待新回答出现");
-    setStatus("waiting_new_answer");
-    await adapter.waitForNewAssistant(beforeSnapshot, state.timeoutMs);
-    setStatus("waiting_stable");
+    appendLog("已点击发送，等待新回答出现。");
 
-    var answer = await adapter.waitForStableAssistantAnswer({
+    setStatus(isFirstRound ? "waiting_first_answer" : "waiting_followup_answer");
+    await adapter.waitForNewAssistant(beforeSnapshot, state.timeoutMs);
+
+    checkAbort();
+
+    setStatus("waiting_stable");
+    answer = await adapter.waitForStableAssistantAnswer({
       stableMs: state.stableMs,
       timeoutMs: state.timeoutMs
     });
 
-    state.latestAnswer = answer;
-    state.answerIndex += 1;
-    state.nextPrompt = "";
-    setStatus("captured_answer");
-    syncUiFromState();
-    appendLog("已捕获新回答");
-    await persistState();
-
-    if (state.stopOnConverged && promptBuilder.detectConverged(answer)) {
-      setStatus("converged");
-      appendLog("检测到 局部收敛：是");
-      await persistState();
-      return true;
+    if (!answer) {
+      throw new Error("新回答为空。");
     }
 
-    return false;
+    return answer;
   }
 
-  async function sendOneRound() {
-    if (isRunning) {
-      throw new Error("已有 DiggAI 任务正在运行。");
-    }
-
-    abortRequested = false;
-    isRunning = true;
-    updateButtonStates();
-
-    try {
-      await executeRound();
-    } finally {
-      isRunning = false;
-      updateButtonStates();
-    }
-  }
-
-  async function startContinuousIteration() {
+  async function startFromOriginalQuestion() {
+    var maxRounds = 0;
     var round = 0;
     var converged = false;
+    var firstAnswer = "";
 
     if (isRunning) {
       throw new Error("已有 DiggAI 任务正在运行。");
     }
 
-    abortRequested = false;
     syncStateFromUi();
-    state.maxRounds = Math.max(1, state.maxRounds);
+
+    if (!state.originalQuestion) {
+      throw new Error("请先输入原始提示词 A。");
+    }
+
+    abortRequested = false;
     isRunning = true;
     updateButtonStates();
 
     try {
-      for (round = 0; round < state.maxRounds; round += 1) {
+      state.latestAnswer = "";
+      state.answerIndex = 0;
+      state.nextPrompt = "";
+      setStatus("ready_from_a");
+      syncUiFromState();
+      await persistState();
+
+      appendLog("开始从原始提示词 A 进行自动迭代。");
+
+      maxRounds = Math.max(1, state.maxRounds);
+
+      setStatus("sending_original_a");
+      appendLog("第 1 轮：发送原始提示词 A。");
+
+      firstAnswer = await sendRawPromptAndCapture(state.originalQuestion);
+
+      state.latestAnswer = firstAnswer;
+      state.answerIndex = 1;
+      state.nextPrompt = "";
+      setStatus("captured_b");
+      syncUiFromState();
+      appendLog("已捕获第一轮回答 B。");
+      await persistState();
+
+      if (state.stopOnConverged && promptBuilder.detectConverged(firstAnswer)) {
+        setStatus("converged");
+        appendLog("第一轮回答中检测到 局部收敛：是，自动停止。");
+        return;
+      }
+
+      for (round = 2; round <= maxRounds; round += 1) {
         checkAbort();
-        converged = await executeRound();
-        if (converged) {
+
+        setStatus("building_followup");
+        appendLog("第 " + round + " 轮：基于原始问题 A 和最新回答生成收敛追问。");
+
+        state.nextPrompt = promptBuilder.buildNextPrompt({
+          originalQuestion: state.originalQuestion,
+          latestAnswer: state.latestAnswer,
+          answerIndex: state.answerIndex,
+          customSuffix: state.customSuffix
+        });
+
+        syncUiFromState();
+        await persistState();
+
+        state.latestAnswer = await sendRawPromptAndCapture(state.nextPrompt);
+        state.answerIndex += 1;
+        state.nextPrompt = "";
+        setStatus("captured_next_answer");
+        syncUiFromState();
+        appendLog("已捕获第 " + round + " 轮回答。");
+        await persistState();
+
+        if (state.stopOnConverged && promptBuilder.detectConverged(state.latestAnswer)) {
+          converged = true;
+          setStatus("converged");
+          appendLog("检测到独立行“局部收敛：是”，自动停止。");
           break;
         }
       }
 
       if (!converged) {
         setStatus("loop_done");
-        appendLog("连续迭代达到设定轮数");
-        await persistState();
+        appendLog("已达到最大迭代轮数。");
       }
     } finally {
       isRunning = false;
@@ -604,17 +674,12 @@
 
   ChatGPTDomAdapter.prototype.queryAll = function (selector) {
     return Array.prototype.slice.call(document.querySelectorAll(selector)).filter(function (node) {
-      return !root.contains(node);
+      return !(root && root.contains(node));
     });
   };
 
   ChatGPTDomAdapter.prototype.getMessages = function (role) {
     var primary = this.queryAll('[data-message-author-role="' + role + '"]');
-
-    if (primary.length) {
-      return primary.sort(compareDomOrder);
-    }
-
     var fallbackSelectors = role === "assistant"
       ? [
         'main article [data-testid="assistant-turn"]',
@@ -625,6 +690,10 @@
         'main [data-testid*="user-message"]'
       ];
     var index = 0;
+
+    if (primary.length) {
+      return primary.sort(compareDomOrder);
+    }
 
     for (index = 0; index < fallbackSelectors.length; index += 1) {
       var nodes = this.queryAll(fallbackSelectors[index]).filter(isVisible);
@@ -669,13 +738,11 @@
       }
 
       var testId = normalizeText(button.getAttribute("data-testid") || "").toLowerCase();
-      var label = normalizeText(
-        [
-          button.getAttribute("aria-label"),
-          button.getAttribute("title"),
-          button.innerText
-        ].join(" ")
-      ).toLowerCase();
+      var label = normalizeText([
+        button.getAttribute("aria-label"),
+        button.getAttribute("title"),
+        button.innerText
+      ].join(" ")).toLowerCase();
 
       if (testId === "stop-button") {
         return true;
@@ -745,7 +812,6 @@
         range.selectNodeContents(composer);
         selection.removeAllRanges();
         selection.addRange(range);
-
         inserted = document.execCommand("insertText", false, value);
       } catch (error) {
         inserted = false;
@@ -876,7 +942,7 @@
     bindUiEvents();
     await restoreState();
     syncUiFromState();
-    appendLog("插件已加载");
+    appendLog("插件已加载。");
   }
 
   void init().catch(function (error) {

@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "0.5.2";
+  var VERSION = "0.6.0";
   var CONVERGED_PATTERN = /^\s*局部收敛\s*[:：]\s*是\s*$/m;
 
   function normalizeText(value) {
@@ -44,11 +44,11 @@
     var latestLabel = labelForAnswerIndex(answerIndex || 1);
 
     if (!originalQuestion) {
-      throw new Error("缺少原始问题 A。请先点击“捕获 A+B”，或手动填写原始问题 A。");
+      throw new Error("缺少原始问题 A。请先输入原始提示词 A。");
     }
 
     if (!latestAnswer) {
-      throw new Error("缺少上一轮回答。请先捕获 ChatGPT 的最新回答。");
+      throw new Error("缺少上一轮回答。请先捕获或生成最新回答。");
     }
 
     return [

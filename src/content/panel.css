@@ -78,6 +78,34 @@
   cursor: not-allowed;
 }
 
+#diggai-panel-root .diggai-debug-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+#diggai-panel-root .diggai-debug-actions button {
+  appearance: none;
+  min-height: 34px;
+  padding: 8px 10px;
+  border: 1px solid #8aa2d1;
+  border-radius: 10px;
+  background: #ffffff;
+  color: #17325e;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+#diggai-panel-root .diggai-debug-actions button:hover:not(:disabled) {
+  background: #eef4ff;
+}
+
+#diggai-panel-root .diggai-debug-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 #diggai-panel-root .diggai-body {
   display: flex;
   flex-direction: column;
@@ -96,6 +124,27 @@
   flex-direction: row;
   align-items: center;
   justify-content: space-between;
+}
+
+#diggai-panel-root .diggai-debug {
+  border: 1px solid #c8d3e6;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.7);
+  padding: 8px 10px;
+}
+
+#diggai-panel-root .diggai-debug-summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: #17325e;
+}
+
+#diggai-panel-root .diggai-debug-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
 }
 
 #diggai-panel-root textarea,
