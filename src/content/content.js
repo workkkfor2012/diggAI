@@ -7,6 +7,7 @@
   window.__DiggAIInstalled = true;
 
   var PANEL_VERSION = "0.6.0";
+  var GITHUB_COMMIT = "6f2ccef";
   var STORAGE_KEY = "diggAI.state.v0.6.0";
   var DEFAULT_STATE = {
     originalQuestion: "",
@@ -31,6 +32,11 @@
   var state = cloneState(DEFAULT_STATE);
   var abortRequested = false;
   var isRunning = false;
+  var panelVisible = false;
+  var panelHideTimer = 0;
+  var PANEL_EDGE_TRIGGER_PX = 24;
+  var PANEL_HIDE_DELAY_MS = 180;
+  var MIN_ASSISTANT_BODY_LENGTH = 20;
   var stopWords = [
     "stop",
     "stop generating",
@@ -269,6 +275,56 @@
     }
   }
 
+  function clearPanelHideTimer() {
+    if (panelHideTimer) {
+      window.clearTimeout(panelHideTimer);
+      panelHideTimer = 0;
+    }
+  }
+
+  function setPanelVisible(visible) {
+    if (!root) {
+      return;
+    }
+
+    clearPanelHideTimer();
+    panelVisible = Boolean(visible);
+    root.classList.toggle("diggai-visible", panelVisible);
+  }
+
+  function scheduleHidePanel() {
+    if (!root) {
+      return;
+    }
+
+    clearPanelHideTimer();
+    panelHideTimer = window.setTimeout(function () {
+      var shell = root.querySelector(".diggai-shell");
+      var hotzone = root.querySelector(".diggai-hotzone");
+
+      if ((shell && shell.matches(":hover")) || (hotzone && hotzone.matches(":hover"))) {
+        return;
+      }
+
+      setPanelVisible(false);
+    }, PANEL_HIDE_DELAY_MS);
+  }
+
+  function handleWindowMouseMove(event) {
+    if (!root) {
+      return;
+    }
+
+    if (event.clientX >= window.innerWidth - PANEL_EDGE_TRIGGER_PX) {
+      setPanelVisible(true);
+      return;
+    }
+
+    if (panelVisible) {
+      scheduleHidePanel();
+    }
+  }
+
   function createLabeledBlock(labelText, control) {
     var wrapper = document.createElement("label");
     var title = document.createElement("span");
@@ -286,10 +342,12 @@
     root = document.createElement("section");
     root.id = "diggai-panel-root";
     root.innerHTML = [
+      '<div class="diggai-hotzone" aria-hidden="true"></div>',
       '<div class="diggai-shell">',
       '  <div class="diggai-header">',
       '    <div class="diggai-title">DiggAI</div>',
       '    <div class="diggai-subtitle">ChatGPT 迭代收敛追问器 v' + PANEL_VERSION + '</div>',
+      '    <div class="diggai-meta">GitHub commit ' + GITHUB_COMMIT + '</div>',
       '    <div class="diggai-status" data-role="status">状态：idle</div>',
       "  </div>",
       '  <div class="diggai-actions">',
@@ -433,6 +491,37 @@
     });
     ui.fill.addEventListener("click", function () {
       void guardedAction(fillComposerFromPreview);
+    });
+  }
+
+  function bindPanelVisibilityEvents() {
+    var hotzone = root.querySelector(".diggai-hotzone");
+    var shell = root.querySelector(".diggai-shell");
+
+    hotzone.addEventListener("mouseenter", function () {
+      setPanelVisible(true);
+    });
+    hotzone.addEventListener("mousemove", function () {
+      setPanelVisible(true);
+    });
+    hotzone.addEventListener("mouseleave", function () {
+      scheduleHidePanel();
+    });
+    shell.addEventListener("mouseenter", function () {
+      setPanelVisible(true);
+    });
+    shell.addEventListener("mouseleave", function () {
+      scheduleHidePanel();
+    });
+    shell.addEventListener("focusin", function () {
+      setPanelVisible(true);
+    });
+    shell.addEventListener("focusout", function () {
+      scheduleHidePanel();
+    });
+    window.addEventListener("mousemove", handleWindowMouseMove, { passive: true });
+    window.addEventListener("blur", function () {
+      setPanelVisible(false);
     });
   }
 
@@ -718,6 +807,38 @@
     return getNodeText(this.getLatestMessage("assistant"));
   };
 
+  ChatGPTDomAdapter.prototype.getLatestAssistantActionScope = function () {
+    var latestMessage = this.getLatestMessage("assistant");
+    var current = latestMessage;
+    var depth = 0;
+
+    while (current && current !== document.body && depth < 8) {
+      if (current.matches && (
+        current.matches("article") ||
+        current.matches('[data-testid="assistant-turn"]') ||
+        current.matches('[data-message-author-role="assistant"]') ||
+        current.matches('[data-testid*="conversation-turn"]')
+      )) {
+        return current;
+      }
+
+      current = current.parentElement;
+      depth += 1;
+    }
+
+    return latestMessage;
+  };
+
+  ChatGPTDomAdapter.prototype.latestAssistantHasCopyButton = function () {
+    var scope = this.getLatestAssistantActionScope();
+
+    if (!scope || !scope.querySelector) {
+      return false;
+    }
+
+    return Boolean(scope.querySelector('[data-testid="copy-turn-action-button"]'));
+  };
+
   ChatGPTDomAdapter.prototype.getAssistantSnapshot = function () {
     var messages = this.getMessages("assistant");
     var latestText = messages.length ? getNodeText(messages[messages.length - 1]) : "";
@@ -910,23 +1031,70 @@
     var settings = options || {};
     var timeoutMs = toPositiveInt(settings.timeoutMs, DEFAULT_STATE.timeoutMs);
     var stableMs = toPositiveInt(settings.stableMs, DEFAULT_STATE.stableMs);
+    var fallbackStableMs = Math.max(stableMs + 1200, 4500);
     var startTime = Date.now();
     var lastHash = "";
     var stableSince = 0;
+    var lastDiagnosticAt = 0;
+    var lastDiagnosticKey = "";
+
+    appendLog("开始判定回答是否完成。");
 
     while (Date.now() - startTime < timeoutMs) {
       checkAbort();
 
       var latestText = this.getLatestAssistantText();
       var latestHash = simpleHash(latestText);
+      var bodyReady = latestText.length >= MIN_ASSISTANT_BODY_LENGTH;
+      var hasCopyButton = this.latestAssistantHasCopyButton();
       var generating = this.isAssistantStillGenerating();
+      var stableFor = 0;
+      var diagnosticKey = "";
+      var now = Date.now();
 
       if (latestText) {
         if (latestHash !== lastHash) {
           lastHash = latestHash;
-          stableSince = Date.now();
-        } else if (!generating && stableSince && Date.now() - stableSince >= stableMs) {
-          return latestText;
+          stableSince = now;
+        } else if (stableSince) {
+          stableFor = now - stableSince;
+
+          if (bodyReady && hasCopyButton && stableFor >= stableMs) {
+            appendLog("回答完成：正文已出现，检测到最新回复 copy 按钮，且文本已稳定。");
+            return latestText;
+          }
+
+          if (bodyReady && !generating && stableFor >= fallbackStableMs) {
+            appendLog("回答完成：正文已出现，且达到兜底稳定条件。");
+            return latestText;
+          }
+
+          if (bodyReady && stableFor >= Math.max(fallbackStableMs + 1500, 6500)) {
+            appendLog("回答完成：正文已出现，达到最长稳定兜底条件。");
+            return latestText;
+          }
+        }
+
+        diagnosticKey = [
+          latestHash,
+          latestText.length,
+          bodyReady ? "body1" : "body0",
+          hasCopyButton ? "copy1" : "copy0",
+          generating ? "gen1" : "gen0",
+          Math.floor(stableFor / 500)
+        ].join("|");
+
+        if (diagnosticKey !== lastDiagnosticKey || now - lastDiagnosticAt >= 1500) {
+          appendLog(
+            "等待稳定：len=" + latestText.length +
+            ", hash=" + latestHash +
+            ", bodyReady=" + (bodyReady ? "yes" : "no") +
+            ", copy=" + (hasCopyButton ? "yes" : "no") +
+            ", generating=" + (generating ? "yes" : "no") +
+            ", stableForMs=" + stableFor
+          );
+          lastDiagnosticKey = diagnosticKey;
+          lastDiagnosticAt = now;
         }
       }
 
@@ -938,10 +1106,12 @@
 
   async function init() {
     createPanel();
+    bindPanelVisibilityEvents();
     adapter = new ChatGPTDomAdapter(root);
     bindUiEvents();
     await restoreState();
     syncUiFromState();
+    setPanelVisible(false);
     appendLog("插件已加载。");
   }
 

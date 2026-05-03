@@ -1,13 +1,16 @@
 #diggai-panel-root {
   position: fixed;
-  top: 12px;
-  right: 12px;
+  top: 0;
+  right: 0;
   z-index: 2147483647;
-  width: 360px;
-  max-height: calc(100vh - 24px);
+  width: 396px;
+  max-width: calc(100vw - 8px);
+  height: 100vh;
   box-sizing: border-box;
   font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
   color: #172033;
+  pointer-events: none;
+  overflow: visible;
 }
 
 #diggai-panel-root * {
@@ -15,9 +18,13 @@
 }
 
 #diggai-panel-root .diggai-shell {
+  position: absolute;
+  top: 12px;
+  right: 12px;
   display: flex;
   flex-direction: column;
   gap: 12px;
+  width: 360px;
   max-height: calc(100vh - 24px);
   overflow: hidden;
   padding: 14px;
@@ -25,6 +32,26 @@
   border-radius: 16px;
   background: linear-gradient(180deg, #f7fbff 0%, #ebf2ff 100%);
   box-shadow: 0 18px 42px rgba(15, 37, 74, 0.22);
+  transform: translateX(calc(100% + 24px));
+  opacity: 0;
+  pointer-events: none;
+  transition: transform 180ms ease, opacity 180ms ease;
+}
+
+#diggai-panel-root.diggai-visible .diggai-shell {
+  transform: translateX(0);
+  opacity: 1;
+  pointer-events: auto;
+}
+
+#diggai-panel-root .diggai-hotzone {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 24px;
+  height: 100vh;
+  pointer-events: auto;
+  background: transparent;
 }
 
 #diggai-panel-root .diggai-header {
@@ -40,10 +67,16 @@
 }
 
 #diggai-panel-root .diggai-subtitle,
+#diggai-panel-root .diggai-meta,
 #diggai-panel-root .diggai-status,
 #diggai-panel-root .diggai-label {
   font-size: 12px;
   line-height: 1.4;
+}
+
+#diggai-panel-root .diggai-meta {
+  color: #5a6f96;
+  font-family: Consolas, "SFMono-Regular", monospace;
 }
 
 #diggai-panel-root .diggai-status {
