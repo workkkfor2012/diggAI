@@ -6,8 +6,8 @@
   }
   window.__DiggAIInstalled = true;
 
-  var PANEL_VERSION = "0.5.1";
-  var STORAGE_KEY = "diggAI.state.v0.5.1";
+  var PANEL_VERSION = "0.5.2";
+  var STORAGE_KEY = "diggAI.state.v0.5.2";
   var DEFAULT_STATE = {
     originalQuestion: "",
     latestAnswer: "",
@@ -279,7 +279,7 @@
       '<div class="diggai-shell">',
       '  <div class="diggai-header">',
       '    <div class="diggai-title">DiggAI</div>',
-      '    <div class="diggai-subtitle">ChatGPT 迭代收敛追问器 v0.5.1</div>',
+      '    <div class="diggai-subtitle">ChatGPT 迭代收敛追问器 v' + PANEL_VERSION + '</div>',
       '    <div class="diggai-status" data-role="status">状态：idle</div>',
       "  </div>",
       '  <div class="diggai-actions">',
@@ -518,7 +518,7 @@
     var beforeSnapshot = adapter.getAssistantSnapshot();
 
     setStatus("sending");
-    adapter.clickSend();
+    await adapter.clickSend();
     appendLog("已点击发送，等待新回答出现");
     setStatus("waiting_new_answer");
     await adapter.waitForNewAssistant(beforeSnapshot, state.timeoutMs);
@@ -701,7 +701,7 @@
     for (outerIndex = 0; outerIndex < selectors.length; outerIndex += 1) {
       var nodes = this.queryAll(selectors[outerIndex]).filter(isVisible);
       if (nodes.length) {
-        return nodes[0];
+        return nodes[nodes.length - 1];
       }
     }
 
@@ -739,7 +739,13 @@
       var inserted = false;
 
       try {
-        document.execCommand("selectAll", false, null);
+        var range = document.createRange();
+        var selection = window.getSelection();
+
+        range.selectNodeContents(composer);
+        selection.removeAllRanges();
+        selection.addRange(range);
+
         inserted = document.execCommand("insertText", false, value);
       } catch (error) {
         inserted = false;
@@ -785,21 +791,32 @@
       });
 
       if (buttons.length) {
-        return buttons[0];
+        return buttons[buttons.length - 1];
       }
     }
 
     return null;
   };
 
-  ChatGPTDomAdapter.prototype.clickSend = function () {
-    var button = this.findSendButton();
+  ChatGPTDomAdapter.prototype.clickSend = async function () {
+    var startedAt = Date.now();
+    var timeoutMs = 8000;
+    var button = null;
 
-    if (!button) {
-      throw new Error("未找到可点击的发送按钮。");
+    while (Date.now() - startedAt < timeoutMs) {
+      checkAbort();
+
+      button = this.findSendButton();
+      if (button) {
+        button.click();
+        await sleep(300);
+        return;
+      }
+
+      await sleep(200);
     }
 
-    button.click();
+    throw new Error("未找到可点击的发送按钮。请确认输入框已填入内容，且 ChatGPT 页面允许发送。");
   };
 
   ChatGPTDomAdapter.prototype.waitForNewAssistant = async function (beforeSnapshot, timeoutMs) {
