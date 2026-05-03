@@ -7,7 +7,7 @@
   window.__DiggAIInstalled = true;
 
   var PANEL_VERSION = "0.6.0";
-  var GITHUB_COMMIT = "6f2ccef";
+  var GITHUB_COMMIT = "59b7eb3";
   var STORAGE_KEY = "diggAI.state.v0.6.0";
   var DEFAULT_STATE = {
     originalQuestion: "",
@@ -36,7 +36,6 @@
   var panelHideTimer = 0;
   var PANEL_EDGE_TRIGGER_PX = 24;
   var PANEL_HIDE_DELAY_MS = 180;
-  var MIN_ASSISTANT_BODY_LENGTH = 20;
   var stopWords = [
     "stop",
     "stop generating",
@@ -829,24 +828,66 @@
     return latestMessage;
   };
 
-  ChatGPTDomAdapter.prototype.latestAssistantHasCopyButton = function () {
-    var scope = this.getLatestAssistantActionScope();
+  ChatGPTDomAdapter.prototype.buttonLooksLikeCopyAction = function (button) {
+    var testId = "";
+    var label = "";
 
-    if (!scope || !scope.querySelector) {
+    if (!button || !isVisible(button)) {
       return false;
     }
 
-    return Boolean(scope.querySelector('[data-testid="copy-turn-action-button"]'));
+    testId = normalizeText(button.getAttribute("data-testid") || "").toLowerCase();
+    label = normalizeText([
+      button.getAttribute("aria-label"),
+      button.getAttribute("title"),
+      button.innerText
+    ].join(" ")).toLowerCase();
+
+    if (testId === "copy-turn-action-button") {
+      return true;
+    }
+
+    return label.indexOf("复制回复") >= 0 ||
+      label.indexOf("复制") >= 0 ||
+      label.indexOf("copy response") >= 0 ||
+      label.indexOf("copy reply") >= 0 ||
+      label.indexOf("copy") >= 0;
+  };
+
+  ChatGPTDomAdapter.prototype.latestAssistantHasCopyButton = function () {
+    var scope = this.getLatestAssistantActionScope();
+    var current = scope;
+    var depth = 0;
+    var buttons = [];
+
+    if (!scope) {
+      return false;
+    }
+
+    while (current && current !== document.body && depth < 6) {
+      buttons = current.querySelectorAll ? Array.prototype.slice.call(current.querySelectorAll("button")) : [];
+
+      if (buttons.some(this.buttonLooksLikeCopyAction.bind(this))) {
+        return true;
+      }
+
+      current = current.parentElement;
+      depth += 1;
+    }
+
+    return false;
   };
 
   ChatGPTDomAdapter.prototype.getAssistantSnapshot = function () {
     var messages = this.getMessages("assistant");
     var latestText = messages.length ? getNodeText(messages[messages.length - 1]) : "";
+    var latestScope = messages.length ? this.getLatestAssistantActionScope() : null;
 
     return {
       count: messages.length,
       latestText: latestText,
-      latestHash: simpleHash(latestText)
+      latestHash: simpleHash(latestText),
+      latestScope: latestScope
     };
   };
 
@@ -1017,6 +1058,10 @@
         return currentSnapshot;
       }
 
+      if (currentSnapshot.latestScope && currentSnapshot.latestScope !== beforeSnapshot.latestScope) {
+        return currentSnapshot;
+      }
+
       if (currentSnapshot.latestHash !== beforeSnapshot.latestHash && currentSnapshot.latestText) {
         return currentSnapshot;
       }
@@ -1030,68 +1075,38 @@
   ChatGPTDomAdapter.prototype.waitForStableAssistantAnswer = async function (options) {
     var settings = options || {};
     var timeoutMs = toPositiveInt(settings.timeoutMs, DEFAULT_STATE.timeoutMs);
-    var stableMs = toPositiveInt(settings.stableMs, DEFAULT_STATE.stableMs);
-    var fallbackStableMs = Math.max(stableMs + 1200, 4500);
     var startTime = Date.now();
-    var lastHash = "";
-    var stableSince = 0;
     var lastDiagnosticAt = 0;
     var lastDiagnosticKey = "";
 
-    appendLog("开始判定回答是否完成。");
+    appendLog("开始等待最新回答出现 copy 按钮。");
 
     while (Date.now() - startTime < timeoutMs) {
       checkAbort();
 
       var latestText = this.getLatestAssistantText();
       var latestHash = simpleHash(latestText);
-      var bodyReady = latestText.length >= MIN_ASSISTANT_BODY_LENGTH;
       var hasCopyButton = this.latestAssistantHasCopyButton();
-      var generating = this.isAssistantStillGenerating();
-      var stableFor = 0;
       var diagnosticKey = "";
       var now = Date.now();
 
       if (latestText) {
-        if (latestHash !== lastHash) {
-          lastHash = latestHash;
-          stableSince = now;
-        } else if (stableSince) {
-          stableFor = now - stableSince;
-
-          if (bodyReady && hasCopyButton && stableFor >= stableMs) {
-            appendLog("回答完成：正文已出现，检测到最新回复 copy 按钮，且文本已稳定。");
-            return latestText;
-          }
-
-          if (bodyReady && !generating && stableFor >= fallbackStableMs) {
-            appendLog("回答完成：正文已出现，且达到兜底稳定条件。");
-            return latestText;
-          }
-
-          if (bodyReady && stableFor >= Math.max(fallbackStableMs + 1500, 6500)) {
-            appendLog("回答完成：正文已出现，达到最长稳定兜底条件。");
-            return latestText;
-          }
+        if (hasCopyButton) {
+          appendLog("回答完成：最新回答已出现 copy 按钮。");
+          return latestText;
         }
 
         diagnosticKey = [
           latestHash,
           latestText.length,
-          bodyReady ? "body1" : "body0",
-          hasCopyButton ? "copy1" : "copy0",
-          generating ? "gen1" : "gen0",
-          Math.floor(stableFor / 500)
+          hasCopyButton ? "copy1" : "copy0"
         ].join("|");
 
         if (diagnosticKey !== lastDiagnosticKey || now - lastDiagnosticAt >= 1500) {
           appendLog(
             "等待稳定：len=" + latestText.length +
             ", hash=" + latestHash +
-            ", bodyReady=" + (bodyReady ? "yes" : "no") +
-            ", copy=" + (hasCopyButton ? "yes" : "no") +
-            ", generating=" + (generating ? "yes" : "no") +
-            ", stableForMs=" + stableFor
+            ", copy=" + (hasCopyButton ? "yes" : "no")
           );
           lastDiagnosticKey = diagnosticKey;
           lastDiagnosticAt = now;
