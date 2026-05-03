@@ -1,0 +1,868 @@
+(function () {
+  "use strict";
+
+  if (window.__DiggAIInstalled) {
+    return;
+  }
+  window.__DiggAIInstalled = true;
+
+  var PANEL_VERSION = "0.5.1";
+  var STORAGE_KEY = "diggAI.state.v0.5.1";
+  var DEFAULT_STATE = {
+    originalQuestion: "",
+    latestAnswer: "",
+    answerIndex: 0,
+    nextPrompt: "",
+    customSuffix: "",
+    maxRounds: 3,
+    stopOnConverged: true,
+    stableMs: 2800,
+    timeoutMs: 180000,
+    status: "idle",
+    logLines: []
+  };
+  var storageApi = typeof browser !== "undefined" && browser.storage && browser.storage.local
+    ? browser.storage.local
+    : null;
+  var promptBuilder = window.DiggAIPromptBuilder;
+  var root = null;
+  var adapter = null;
+  var ui = {};
+  var state = cloneState(DEFAULT_STATE);
+  var abortRequested = false;
+  var isRunning = false;
+  var stopWords = [
+    "stop",
+    "stop generating",
+    "stop streaming",
+    "停止生成",
+    "停止回答",
+    "停止响应"
+  ];
+
+  if (!promptBuilder) {
+    console.error("[DiggAI] promptBuilder.js 未按顺序加载。");
+    return;
+  }
+
+  function normalizeText(value) {
+    return String(value == null ? "" : value).replace(/\r\n/g, "\n").trim();
+  }
+
+  function cloneState(source) {
+    var input = source || {};
+    return {
+      originalQuestion: normalizeText(input.originalQuestion || ""),
+      latestAnswer: normalizeText(input.latestAnswer || ""),
+      answerIndex: toPositiveInt(input.answerIndex, 0),
+      nextPrompt: normalizeText(input.nextPrompt || ""),
+      customSuffix: normalizeText(input.customSuffix || ""),
+      maxRounds: toPositiveInt(input.maxRounds, DEFAULT_STATE.maxRounds),
+      stopOnConverged: input.stopOnConverged !== false,
+      stableMs: toPositiveInt(input.stableMs, DEFAULT_STATE.stableMs),
+      timeoutMs: toPositiveInt(input.timeoutMs, DEFAULT_STATE.timeoutMs),
+      status: normalizeText(input.status || DEFAULT_STATE.status) || DEFAULT_STATE.status,
+      logLines: Array.isArray(input.logLines) ? input.logLines.slice(-200) : []
+    };
+  }
+
+  function toPositiveInt(value, fallback) {
+    var parsed = Number(value);
+
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      return fallback;
+    }
+
+    return Math.floor(parsed);
+  }
+
+  function simpleHash(text) {
+    var input = String(text || "");
+    var hash = 0;
+    var index = 0;
+
+    for (index = 0; index < input.length; index += 1) {
+      hash = (hash * 31 + input.charCodeAt(index)) >>> 0;
+    }
+
+    return String(hash);
+  }
+
+  function sleep(ms) {
+    return new Promise(function (resolve) {
+      window.setTimeout(resolve, ms);
+    });
+  }
+
+  function checkAbort() {
+    if (abortRequested) {
+      throw new Error("用户已停止。");
+    }
+  }
+
+  function isVisible(node) {
+    if (!node || !node.isConnected) {
+      return false;
+    }
+
+    var rect = node.getBoundingClientRect();
+    var style = window.getComputedStyle(node);
+
+    return rect.width > 0 &&
+      rect.height > 0 &&
+      style.visibility !== "hidden" &&
+      style.display !== "none";
+  }
+
+  function compareDomOrder(left, right) {
+    if (left === right) {
+      return 0;
+    }
+
+    var position = left.compareDocumentPosition(right);
+
+    if (position & Node.DOCUMENT_POSITION_FOLLOWING) {
+      return -1;
+    }
+
+    if (position & Node.DOCUMENT_POSITION_PRECEDING) {
+      return 1;
+    }
+
+    return 0;
+  }
+
+  function getNodeText(node) {
+    if (!node) {
+      return "";
+    }
+
+    var preferred = node.querySelector
+      ? node.querySelector(".markdown, [data-message-content], .whitespace-pre-wrap")
+      : null;
+    var target = preferred || node;
+
+    return normalizeText(target.innerText || target.textContent || "");
+  }
+
+  function setStatus(nextStatus) {
+    state.status = nextStatus;
+
+    if (ui.status) {
+      ui.status.textContent = "状态：" + nextStatus;
+    }
+
+    updateButtonStates();
+    void persistState();
+  }
+
+  function appendLog(message, isError) {
+    var timestamp = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    var line = "[" + timestamp + "] " + message;
+
+    state.logLines.push(line);
+    state.logLines = state.logLines.slice(-200);
+
+    if (ui.logLines) {
+      ui.logLines.value = state.logLines.join("\n");
+      ui.logLines.scrollTop = ui.logLines.scrollHeight;
+    }
+
+    if (isError) {
+      console.error("[DiggAI]", message);
+    } else {
+      console.log("[DiggAI]", message);
+    }
+
+    void persistState();
+  }
+
+  async function persistState() {
+    if (!storageApi) {
+      return;
+    }
+
+    try {
+      await storageApi.set((function () {
+        var payload = {};
+        payload[STORAGE_KEY] = cloneState(state);
+        return payload;
+      })());
+    } catch (error) {
+      console.warn("[DiggAI] 持久化失败:", error);
+    }
+  }
+
+  async function restoreState() {
+    if (!storageApi) {
+      return;
+    }
+
+    try {
+      var result = await storageApi.get(STORAGE_KEY);
+      if (result && result[STORAGE_KEY]) {
+        state = cloneState(result[STORAGE_KEY]);
+      }
+    } catch (error) {
+      console.warn("[DiggAI] 读取持久化状态失败:", error);
+    }
+  }
+
+  function syncStateFromUi() {
+    if (!ui.originalQuestion) {
+      return;
+    }
+
+    state.originalQuestion = normalizeText(ui.originalQuestion.value);
+    state.latestAnswer = normalizeText(ui.latestAnswer.value);
+    state.customSuffix = normalizeText(ui.customSuffix.value);
+    state.nextPrompt = normalizeText(ui.nextPrompt.value);
+    state.maxRounds = toPositiveInt(ui.maxRounds.value, DEFAULT_STATE.maxRounds) || 1;
+    state.stableMs = toPositiveInt(ui.stableMs.value, DEFAULT_STATE.stableMs) || DEFAULT_STATE.stableMs;
+    state.timeoutMs = toPositiveInt(ui.timeoutMs.value, DEFAULT_STATE.timeoutMs) || DEFAULT_STATE.timeoutMs;
+    state.stopOnConverged = Boolean(ui.stopOnConverged.checked);
+  }
+
+  function syncUiFromState() {
+    if (!ui.originalQuestion) {
+      return;
+    }
+
+    ui.originalQuestion.value = state.originalQuestion;
+    ui.latestAnswer.value = state.latestAnswer;
+    ui.customSuffix.value = state.customSuffix;
+    ui.maxRounds.value = String(state.maxRounds);
+    ui.stableMs.value = String(state.stableMs);
+    ui.timeoutMs.value = String(state.timeoutMs);
+    ui.stopOnConverged.checked = Boolean(state.stopOnConverged);
+    ui.nextPrompt.value = state.nextPrompt;
+    ui.logLines.value = state.logLines.join("\n");
+    ui.status.textContent = "状态：" + state.status;
+    updateButtonStates();
+  }
+
+  function updateButtonStates() {
+    if (!ui.startLoop) {
+      return;
+    }
+
+    ui.startLoop.disabled = isRunning;
+    ui.stop.disabled = !isRunning;
+    ui.sendOne.disabled = isRunning;
+  }
+
+  function setFieldValue(element, value) {
+    if (!element) {
+      return;
+    }
+
+    element.value = value;
+  }
+
+  function createLabeledBlock(labelText, control) {
+    var wrapper = document.createElement("label");
+    var title = document.createElement("span");
+
+    wrapper.className = "diggai-field";
+    title.className = "diggai-label";
+    title.textContent = labelText;
+    wrapper.appendChild(title);
+    wrapper.appendChild(control);
+
+    return wrapper;
+  }
+
+  function createPanel() {
+    root = document.createElement("section");
+    root.id = "diggai-panel-root";
+    root.innerHTML = [
+      '<div class="diggai-shell">',
+      '  <div class="diggai-header">',
+      '    <div class="diggai-title">DiggAI</div>',
+      '    <div class="diggai-subtitle">ChatGPT 迭代收敛追问器 v0.5.1</div>',
+      '    <div class="diggai-status" data-role="status">状态：idle</div>',
+      "  </div>",
+      '  <div class="diggai-actions">',
+      '    <button type="button" data-action="capture-ab">捕获 A+B</button>',
+      '    <button type="button" data-action="capture-latest">仅捕获最新回答</button>',
+      '    <button type="button" data-action="generate">生成下一轮 Prompt</button>',
+      '    <button type="button" data-action="fill">填入输入框</button>',
+      '    <button type="button" data-action="send-one">发送一轮</button>',
+      '    <button type="button" data-action="start-loop">开始连续迭代</button>',
+      '    <button type="button" data-action="stop">停止</button>',
+      "  </div>",
+      '  <div class="diggai-body"></div>',
+      "</div>"
+    ].join("");
+
+    (document.body || document.documentElement).appendChild(root);
+
+    var body = root.querySelector(".diggai-body");
+    var originalQuestion = document.createElement("textarea");
+    var latestAnswer = document.createElement("textarea");
+    var customSuffix = document.createElement("textarea");
+    var maxRounds = document.createElement("input");
+    var stableMs = document.createElement("input");
+    var timeoutMs = document.createElement("input");
+    var stopOnConverged = document.createElement("input");
+    var nextPrompt = document.createElement("textarea");
+    var logLines = document.createElement("textarea");
+
+    originalQuestion.rows = 4;
+    latestAnswer.rows = 6;
+    customSuffix.rows = 3;
+    nextPrompt.rows = 8;
+    logLines.rows = 8;
+    logLines.readOnly = true;
+
+    maxRounds.type = "number";
+    maxRounds.min = "1";
+    stableMs.type = "number";
+    stableMs.min = "100";
+    timeoutMs.type = "number";
+    timeoutMs.min = "1000";
+    stopOnConverged.type = "checkbox";
+
+    body.appendChild(createLabeledBlock("原始问题 A", originalQuestion));
+    body.appendChild(createLabeledBlock("上一轮 / 最新回答", latestAnswer));
+    body.appendChild(createLabeledBlock("自定义追加字符串", customSuffix));
+    body.appendChild(createLabeledBlock("连续迭代轮数", maxRounds));
+    body.appendChild(createLabeledBlock("稳定等待 ms", stableMs));
+    body.appendChild(createLabeledBlock("单轮超时 ms", timeoutMs));
+
+    var checkboxWrapper = document.createElement("label");
+    var checkboxTitle = document.createElement("span");
+    checkboxWrapper.className = "diggai-field diggai-checkbox";
+    checkboxTitle.className = "diggai-label";
+    checkboxTitle.textContent = "是否检测“局部收敛：是”后停止";
+    checkboxWrapper.appendChild(checkboxTitle);
+    checkboxWrapper.appendChild(stopOnConverged);
+    body.appendChild(checkboxWrapper);
+
+    body.appendChild(createLabeledBlock("下一轮 Prompt 预览", nextPrompt));
+    body.appendChild(createLabeledBlock("运行日志", logLines));
+
+    ui = {
+      status: root.querySelector('[data-role="status"]'),
+      captureAB: root.querySelector('[data-action="capture-ab"]'),
+      captureLatest: root.querySelector('[data-action="capture-latest"]'),
+      generate: root.querySelector('[data-action="generate"]'),
+      fill: root.querySelector('[data-action="fill"]'),
+      sendOne: root.querySelector('[data-action="send-one"]'),
+      startLoop: root.querySelector('[data-action="start-loop"]'),
+      stop: root.querySelector('[data-action="stop"]'),
+      originalQuestion: originalQuestion,
+      latestAnswer: latestAnswer,
+      customSuffix: customSuffix,
+      maxRounds: maxRounds,
+      stableMs: stableMs,
+      timeoutMs: timeoutMs,
+      stopOnConverged: stopOnConverged,
+      nextPrompt: nextPrompt,
+      logLines: logLines
+    };
+  }
+
+  function bindUiEvents() {
+    [
+      ui.originalQuestion,
+      ui.latestAnswer,
+      ui.customSuffix,
+      ui.maxRounds,
+      ui.stableMs,
+      ui.timeoutMs,
+      ui.stopOnConverged,
+      ui.nextPrompt
+    ].forEach(function (element) {
+      element.addEventListener("input", function () {
+        syncStateFromUi();
+        void persistState();
+      });
+      element.addEventListener("change", function () {
+        syncStateFromUi();
+        void persistState();
+      });
+    });
+
+    ui.captureAB.addEventListener("click", function () {
+      void guardedAction(captureAB);
+    });
+    ui.captureLatest.addEventListener("click", function () {
+      void guardedAction(captureLatestAnswerOnly);
+    });
+    ui.generate.addEventListener("click", function () {
+      void guardedAction(generateNextPrompt);
+    });
+    ui.fill.addEventListener("click", function () {
+      void guardedAction(fillComposerFromPreview);
+    });
+    ui.sendOne.addEventListener("click", function () {
+      void guardedAction(sendOneRound);
+    });
+    ui.startLoop.addEventListener("click", function () {
+      void guardedAction(startContinuousIteration);
+    });
+    ui.stop.addEventListener("click", function () {
+      abortRequested = true;
+      if (!isRunning) {
+        setStatus("stopped");
+        appendLog("用户已停止");
+      }
+    });
+  }
+
+  function guardedAction(handler) {
+    return handler().catch(function (error) {
+      handleError(error);
+    });
+  }
+
+  function handleError(error) {
+    var message = error && error.message ? error.message : String(error);
+
+    if (message === "用户已停止。") {
+      setStatus("stopped");
+      appendLog("用户已停止");
+    } else {
+      setStatus("error");
+      appendLog(message, true);
+    }
+  }
+
+  function buildPromptFromState() {
+    syncStateFromUi();
+    state.nextPrompt = promptBuilder.buildNextPrompt({
+      originalQuestion: state.originalQuestion,
+      latestAnswer: state.latestAnswer,
+      answerIndex: state.answerIndex || 1,
+      customSuffix: state.customSuffix
+    });
+    setFieldValue(ui.nextPrompt, state.nextPrompt);
+    setStatus("prompt_ready");
+    appendLog("已生成下一轮 Prompt");
+    void persistState();
+    return state.nextPrompt;
+  }
+
+  async function captureAB() {
+    var userText = adapter.getLatestUserText();
+    var assistantText = adapter.getLatestAssistantText();
+
+    if (!userText) {
+      throw new Error("未找到 ChatGPT 的最新用户消息。");
+    }
+
+    if (!assistantText) {
+      throw new Error("未找到 ChatGPT 的最新回答。");
+    }
+
+    state.originalQuestion = userText;
+    state.latestAnswer = assistantText;
+    state.answerIndex = 1;
+    state.nextPrompt = "";
+    setStatus("captured");
+    syncUiFromState();
+    appendLog("已捕获 A+B");
+    await persistState();
+  }
+
+  async function captureLatestAnswerOnly() {
+    var assistantText = adapter.getLatestAssistantText();
+
+    if (!assistantText) {
+      throw new Error("未找到 ChatGPT 的最新回答。");
+    }
+
+    if (state.latestAnswer && state.latestAnswer !== assistantText && state.answerIndex > 0) {
+      state.answerIndex += 1;
+    } else if (!state.answerIndex) {
+      state.answerIndex = 1;
+    }
+
+    state.latestAnswer = assistantText;
+    state.nextPrompt = "";
+    setStatus("captured");
+    syncUiFromState();
+    appendLog("已捕获最新回答");
+    await persistState();
+  }
+
+  async function generateNextPrompt() {
+    buildPromptFromState();
+    syncUiFromState();
+    await persistState();
+  }
+
+  async function fillComposerFromPreview() {
+    syncStateFromUi();
+
+    if (!state.nextPrompt) {
+      buildPromptFromState();
+    }
+
+    adapter.fillComposer(state.nextPrompt);
+    setStatus("filling");
+    appendLog("已填入输入框");
+    await persistState();
+  }
+
+  async function executeRound() {
+    checkAbort();
+    buildPromptFromState();
+    adapter.fillComposer(state.nextPrompt);
+    setStatus("filling");
+    appendLog("已填入输入框");
+    await sleep(150);
+    checkAbort();
+
+    var beforeSnapshot = adapter.getAssistantSnapshot();
+
+    setStatus("sending");
+    adapter.clickSend();
+    appendLog("已点击发送，等待新回答出现");
+    setStatus("waiting_new_answer");
+    await adapter.waitForNewAssistant(beforeSnapshot, state.timeoutMs);
+    setStatus("waiting_stable");
+
+    var answer = await adapter.waitForStableAssistantAnswer({
+      stableMs: state.stableMs,
+      timeoutMs: state.timeoutMs
+    });
+
+    state.latestAnswer = answer;
+    state.answerIndex += 1;
+    state.nextPrompt = "";
+    setStatus("captured_answer");
+    syncUiFromState();
+    appendLog("已捕获新回答");
+    await persistState();
+
+    if (state.stopOnConverged && promptBuilder.detectConverged(answer)) {
+      setStatus("converged");
+      appendLog("检测到 局部收敛：是");
+      await persistState();
+      return true;
+    }
+
+    return false;
+  }
+
+  async function sendOneRound() {
+    if (isRunning) {
+      throw new Error("已有 DiggAI 任务正在运行。");
+    }
+
+    abortRequested = false;
+    isRunning = true;
+    updateButtonStates();
+
+    try {
+      await executeRound();
+    } finally {
+      isRunning = false;
+      updateButtonStates();
+    }
+  }
+
+  async function startContinuousIteration() {
+    var round = 0;
+    var converged = false;
+
+    if (isRunning) {
+      throw new Error("已有 DiggAI 任务正在运行。");
+    }
+
+    abortRequested = false;
+    syncStateFromUi();
+    state.maxRounds = Math.max(1, state.maxRounds);
+    isRunning = true;
+    updateButtonStates();
+
+    try {
+      for (round = 0; round < state.maxRounds; round += 1) {
+        checkAbort();
+        converged = await executeRound();
+        if (converged) {
+          break;
+        }
+      }
+
+      if (!converged) {
+        setStatus("loop_done");
+        appendLog("连续迭代达到设定轮数");
+        await persistState();
+      }
+    } finally {
+      isRunning = false;
+      updateButtonStates();
+    }
+  }
+
+  function ChatGPTDomAdapter(panelRoot) {
+    this.panelRoot = panelRoot;
+  }
+
+  ChatGPTDomAdapter.prototype.queryAll = function (selector) {
+    return Array.prototype.slice.call(document.querySelectorAll(selector)).filter(function (node) {
+      return !root.contains(node);
+    });
+  };
+
+  ChatGPTDomAdapter.prototype.getMessages = function (role) {
+    var primary = this.queryAll('[data-message-author-role="' + role + '"]');
+
+    if (primary.length) {
+      return primary.sort(compareDomOrder);
+    }
+
+    var fallbackSelectors = role === "assistant"
+      ? [
+        'main article [data-testid="assistant-turn"]',
+        'main [data-testid*="assistant-message"]'
+      ]
+      : [
+        'main article [data-testid="user-turn"]',
+        'main [data-testid*="user-message"]'
+      ];
+    var index = 0;
+
+    for (index = 0; index < fallbackSelectors.length; index += 1) {
+      var nodes = this.queryAll(fallbackSelectors[index]).filter(isVisible);
+      if (nodes.length) {
+        return nodes.sort(compareDomOrder);
+      }
+    }
+
+    return [];
+  };
+
+  ChatGPTDomAdapter.prototype.getLatestMessage = function (role) {
+    var messages = this.getMessages(role);
+    return messages.length ? messages[messages.length - 1] : null;
+  };
+
+  ChatGPTDomAdapter.prototype.getLatestUserText = function () {
+    return getNodeText(this.getLatestMessage("user"));
+  };
+
+  ChatGPTDomAdapter.prototype.getLatestAssistantText = function () {
+    return getNodeText(this.getLatestMessage("assistant"));
+  };
+
+  ChatGPTDomAdapter.prototype.getAssistantSnapshot = function () {
+    var messages = this.getMessages("assistant");
+    var latestText = messages.length ? getNodeText(messages[messages.length - 1]) : "";
+
+    return {
+      count: messages.length,
+      latestText: latestText,
+      latestHash: simpleHash(latestText)
+    };
+  };
+
+  ChatGPTDomAdapter.prototype.isAssistantStillGenerating = function () {
+    var buttons = this.queryAll("button");
+
+    return buttons.some(function (button) {
+      if (!isVisible(button)) {
+        return false;
+      }
+
+      var testId = normalizeText(button.getAttribute("data-testid") || "").toLowerCase();
+      var label = normalizeText(
+        [
+          button.getAttribute("aria-label"),
+          button.getAttribute("title"),
+          button.innerText
+        ].join(" ")
+      ).toLowerCase();
+
+      if (testId === "stop-button") {
+        return true;
+      }
+
+      return stopWords.some(function (word) {
+        return label.indexOf(word) >= 0;
+      });
+    });
+  };
+
+  ChatGPTDomAdapter.prototype.findComposer = function () {
+    var selectors = [
+      "#prompt-textarea",
+      '[data-testid="composer-text-input"]',
+      'textarea[placeholder*="Message"]',
+      'textarea[placeholder*="发送"]',
+      'textarea[placeholder*="询问"]',
+      'div[contenteditable="true"]'
+    ];
+    var outerIndex = 0;
+
+    for (outerIndex = 0; outerIndex < selectors.length; outerIndex += 1) {
+      var nodes = this.queryAll(selectors[outerIndex]).filter(isVisible);
+      if (nodes.length) {
+        return nodes[0];
+      }
+    }
+
+    return null;
+  };
+
+  ChatGPTDomAdapter.prototype.fillComposer = function (text) {
+    var composer = this.findComposer();
+    var value = String(text || "");
+
+    if (!composer) {
+      throw new Error("未找到 ChatGPT 输入框。");
+    }
+
+    composer.focus();
+
+    if (composer.tagName === "TEXTAREA" || composer.tagName === "INPUT") {
+      var prototype = composer.tagName === "TEXTAREA"
+        ? window.HTMLTextAreaElement.prototype
+        : window.HTMLInputElement.prototype;
+      var descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+
+      if (descriptor && descriptor.set) {
+        descriptor.set.call(composer, value);
+      } else {
+        composer.value = value;
+      }
+
+      composer.dispatchEvent(new Event("input", { bubbles: true }));
+      composer.dispatchEvent(new Event("change", { bubbles: true }));
+      return composer;
+    }
+
+    if (composer.isContentEditable) {
+      var inserted = false;
+
+      try {
+        document.execCommand("selectAll", false, null);
+        inserted = document.execCommand("insertText", false, value);
+      } catch (error) {
+        inserted = false;
+      }
+
+      if (!inserted) {
+        composer.textContent = value;
+      }
+
+      try {
+        composer.dispatchEvent(new InputEvent("input", {
+          bubbles: true,
+          data: value,
+          inputType: "insertText"
+        }));
+      } catch (inputError) {
+        composer.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+
+      composer.dispatchEvent(new Event("change", { bubbles: true }));
+      return composer;
+    }
+
+    throw new Error("识别到了输入节点，但不支持的输入框类型。");
+  };
+
+  ChatGPTDomAdapter.prototype.findSendButton = function () {
+    var selectors = [
+      'button[data-testid="send-button"]',
+      'button[aria-label="Send prompt"]',
+      'button[aria-label="发送提示"]',
+      'button[aria-label*="Send"]',
+      'button[aria-label*="发送"]',
+      'form button[type="submit"]'
+    ];
+    var outerIndex = 0;
+
+    for (outerIndex = 0; outerIndex < selectors.length; outerIndex += 1) {
+      var buttons = this.queryAll(selectors[outerIndex]).filter(function (button) {
+        return isVisible(button) &&
+          !button.disabled &&
+          button.getAttribute("aria-disabled") !== "true";
+      });
+
+      if (buttons.length) {
+        return buttons[0];
+      }
+    }
+
+    return null;
+  };
+
+  ChatGPTDomAdapter.prototype.clickSend = function () {
+    var button = this.findSendButton();
+
+    if (!button) {
+      throw new Error("未找到可点击的发送按钮。");
+    }
+
+    button.click();
+  };
+
+  ChatGPTDomAdapter.prototype.waitForNewAssistant = async function (beforeSnapshot, timeoutMs) {
+    var startTime = Date.now();
+
+    while (Date.now() - startTime < timeoutMs) {
+      var currentSnapshot = this.getAssistantSnapshot();
+      checkAbort();
+
+      if (currentSnapshot.count > beforeSnapshot.count) {
+        return currentSnapshot;
+      }
+
+      if (currentSnapshot.latestHash !== beforeSnapshot.latestHash && currentSnapshot.latestText) {
+        return currentSnapshot;
+      }
+
+      await sleep(350);
+    }
+
+    throw new Error("等待新回答出现超时。");
+  };
+
+  ChatGPTDomAdapter.prototype.waitForStableAssistantAnswer = async function (options) {
+    var settings = options || {};
+    var timeoutMs = toPositiveInt(settings.timeoutMs, DEFAULT_STATE.timeoutMs);
+    var stableMs = toPositiveInt(settings.stableMs, DEFAULT_STATE.stableMs);
+    var startTime = Date.now();
+    var lastHash = "";
+    var stableSince = 0;
+
+    while (Date.now() - startTime < timeoutMs) {
+      checkAbort();
+
+      var latestText = this.getLatestAssistantText();
+      var latestHash = simpleHash(latestText);
+      var generating = this.isAssistantStillGenerating();
+
+      if (latestText) {
+        if (latestHash !== lastHash) {
+          lastHash = latestHash;
+          stableSince = Date.now();
+        } else if (!generating && stableSince && Date.now() - stableSince >= stableMs) {
+          return latestText;
+        }
+      }
+
+      await sleep(350);
+    }
+
+    throw new Error("等待回答稳定超时。");
+  };
+
+  async function init() {
+    createPanel();
+    adapter = new ChatGPTDomAdapter(root);
+    bindUiEvents();
+    await restoreState();
+    syncUiFromState();
+    appendLog("插件已加载");
+  }
+
+  void init().catch(function (error) {
+    handleError(error);
+  });
+})();

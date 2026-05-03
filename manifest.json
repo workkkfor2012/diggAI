@@ -1,0 +1,32 @@
+{
+  "manifest_version": 2,
+  "name": "DiggAI - ChatGPT Iteration Convergence",
+  "version": "0.5.1",
+  "description": "A Firefox WebExtension for iterative convergence prompting on chatgpt.com.",
+  "permissions": [
+    "storage"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "src/shared/promptBuilder.js",
+        "src/content/content.js"
+      ],
+      "css": [
+        "src/content/panel.css"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "diggai-iter-convergence@local.dev",
+      "strict_min_version": "109.0"
+    }
+  }
+}
