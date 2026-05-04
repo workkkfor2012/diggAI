@@ -6,9 +6,9 @@
   }
   window.__DiggAIInstalled = true;
 
-  var PANEL_VERSION = "0.6.1";
+  var PANEL_VERSION = "0.6.2";
   var GITHUB_COMMIT = "0542d9c";
-  var STORAGE_KEY = "diggAI.state.v0.6.1";
+  var STORAGE_KEY = "diggAI.state.v0.6.2";
   var DEFAULT_STATE = {
     originalQuestion: "",
     latestAnswer: "",
@@ -34,6 +34,11 @@
   var isRunning = false;
   var panelVisible = false;
   var panelHideTimer = 0;
+  var clipboardBridgeInstalled = false;
+  var lastCopiedFromPage = "";
+  var lastCopiedFromPageAt = 0;
+  var audioContextRef = null;
+  var lastCompletionSoundStatus = "";
   var PANEL_EDGE_TRIGGER_PX = 24;
   var PANEL_HIDE_DELAY_MS = 180;
   var stopWords = [
@@ -150,11 +155,72 @@
     return normalizeText(target.innerText || target.textContent || "");
   }
 
+  function isCompletionStatus(status) {
+    return status === "converged" || status === "loop_done";
+  }
+
+  function getAudioContext() {
+    var AudioContextClass = window.AudioContext || window.webkitAudioContext;
+
+    if (!AudioContextClass) {
+      return null;
+    }
+
+    if (!audioContextRef) {
+      audioContextRef = new AudioContextClass();
+    }
+
+    return audioContextRef;
+  }
+
+  function playCompletionSound() {
+    var context = getAudioContext();
+
+    function playBeep(startOffset, frequency, duration) {
+      var oscillator = context.createOscillator();
+      var gainNode = context.createGain();
+      var startAt = context.currentTime + startOffset;
+      var endAt = startAt + duration;
+
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(frequency, startAt);
+      gainNode.gain.setValueAtTime(0.0001, startAt);
+      gainNode.gain.exponentialRampToValueAtTime(0.12, startAt + 0.02);
+      gainNode.gain.exponentialRampToValueAtTime(0.0001, endAt);
+      oscillator.connect(gainNode);
+      gainNode.connect(context.destination);
+      oscillator.start(startAt);
+      oscillator.stop(endAt);
+    }
+
+    if (!context) {
+      return;
+    }
+
+    Promise.resolve(context.state === "suspended" ? context.resume() : undefined)
+      .then(function () {
+        playBeep(0, 880, 0.14);
+        playBeep(0.18, 1174, 0.18);
+      })
+      .catch(function () {
+        console.warn("[DiggAI] completion sound failed");
+      });
+  }
+
   function setStatus(nextStatus) {
     state.status = nextStatus;
 
     if (ui.status) {
       ui.status.textContent = "状态：" + nextStatus;
+    }
+
+    if (isCompletionStatus(nextStatus) && lastCompletionSoundStatus !== nextStatus) {
+      lastCompletionSoundStatus = nextStatus;
+      playCompletionSound();
+    }
+
+    if (!isCompletionStatus(nextStatus)) {
+      lastCompletionSoundStatus = "";
     }
 
     updateButtonStates();
@@ -196,6 +262,59 @@
     } catch (error) {
       console.warn("[DiggAI] 持久化失败:", error);
     }
+  }
+
+  function installClipboardBridge() {
+    if (clipboardBridgeInstalled) {
+      return;
+    }
+
+    clipboardBridgeInstalled = true;
+
+    window.addEventListener("message", function (event) {
+      var data = event && event.data;
+
+      if (event.source !== window || !data || data.source !== "diggai-page-clipboard") {
+        return;
+      }
+
+      if (data.type === "clipboard-write") {
+        lastCopiedFromPage = normalizeText(data.text || "");
+        lastCopiedFromPageAt = Date.now();
+        appendLog("页面剪贴板桥已捕获文本，len=" + lastCopiedFromPage.length);
+      }
+    });
+
+    var script = document.createElement("script");
+    script.type = "text/javascript";
+    script.textContent = [
+      "(function(){",
+      "  if (window.__DiggAIClipboardBridgeInstalled) { return; }",
+      "  window.__DiggAIClipboardBridgeInstalled = true;",
+      "  if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') { return; }",
+      "  var originalWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);",
+      "  navigator.clipboard.writeText = function(text){",
+      "    var normalized = String(text == null ? '' : text);",
+      "    try {",
+      "      window.postMessage({",
+      "        source: 'diggai-page-clipboard',",
+      "        type: 'clipboard-write',",
+      "        text: normalized",
+      "      }, '*');",
+      "    } catch (error) {}",
+      "    try {",
+      "      return Promise.resolve(originalWriteText(text)).catch(function(){",
+      "        return undefined;",
+      "      });",
+      "    } catch (error) {",
+      "      return Promise.resolve(undefined);",
+      "    }",
+      "  };",
+      "})();"
+    ].join("");
+
+    (document.documentElement || document.head || document.body).appendChild(script);
+    script.remove();
   }
 
   async function restoreState() {
@@ -252,6 +371,7 @@
     }
 
     ui.startFromA.disabled = isRunning;
+    ui.iterateOnce.disabled = isRunning;
     ui.stop.disabled = !isRunning;
 
     if (ui.captureAB) {
@@ -351,6 +471,7 @@
       "  </div>",
       '  <div class="diggai-actions">',
       '    <button type="button" data-action="start-from-a">开始迭代</button>',
+      '    <button type="button" data-action="iterate-once">迭代1次</button>',
       '    <button type="button" data-action="stop">停止</button>',
       "  </div>",
       '  <div class="diggai-body"></div>',
@@ -430,6 +551,7 @@
     ui = {
       status: root.querySelector('[data-role="status"]'),
       startFromA: root.querySelector('[data-action="start-from-a"]'),
+      iterateOnce: root.querySelector('[data-action="iterate-once"]'),
       stop: root.querySelector('[data-action="stop"]'),
       captureAB: debugActions.querySelector('[data-action="capture-ab"]'),
       captureLatest: debugActions.querySelector('[data-action="capture-latest"]'),
@@ -470,6 +592,9 @@
 
     ui.startFromA.addEventListener("click", function () {
       void guardedAction(startFromOriginalQuestion);
+    });
+    ui.iterateOnce.addEventListener("click", function () {
+      void guardedAction(iterateOnceFromCurrentPage);
     });
     ui.stop.addEventListener("click", function () {
       abortRequested = true;
@@ -620,6 +745,65 @@
     await persistState();
   }
 
+  async function iterateOnceFromCurrentPage() {
+    var userText = "";
+    var assistantText = "";
+    var nextAnswer = "";
+
+    if (isRunning) {
+      throw new Error("已有 DiggAI 任务正在运行。");
+    }
+
+    syncStateFromUi();
+    userText = adapter.getLatestUserText();
+    assistantText = adapter.getLatestAssistantText();
+
+    if (!userText && !state.originalQuestion) {
+      throw new Error("未找到当前页面的最新问题，也没有面板中的原始问题 A。");
+    }
+
+    if (!assistantText) {
+      throw new Error("未找到当前页面的最新回答。");
+    }
+
+    abortRequested = false;
+    isRunning = true;
+    updateButtonStates();
+
+    try {
+      state.originalQuestion = userText || state.originalQuestion;
+      state.latestAnswer = assistantText;
+      state.answerIndex = 1;
+      state.nextPrompt = promptBuilder.buildNextPrompt({
+        originalQuestion: state.originalQuestion,
+        latestAnswer: state.latestAnswer,
+        answerIndex: state.answerIndex,
+        customSuffix: state.customSuffix
+      });
+
+      setStatus("building_followup");
+      syncUiFromState();
+      appendLog("已从当前页面捕获问题和回答，准备单次迭代。");
+      await persistState();
+
+      appendLog("等待 3 秒后再切换到新聊天。");
+      await sleep(3000);
+      checkAbort();
+
+      nextAnswer = await sendRawPromptAndCapture(state.nextPrompt);
+      state.latestAnswer = nextAnswer;
+      state.answerIndex = 2;
+      state.nextPrompt = "";
+      setStatus("loop_done");
+      syncUiFromState();
+      appendLog("单次迭代已完成。");
+      await persistState();
+    } finally {
+      isRunning = false;
+      updateButtonStates();
+    }
+  }
+
   async function sendRawPromptAndCapture(promptText) {
     checkAbort();
 
@@ -631,6 +815,12 @@
     if (!prompt) {
       throw new Error("待发送 Prompt 为空。");
     }
+
+    appendLog("正在切换到新聊天。");
+    await adapter.openFreshChat(state.timeoutMs);
+    appendLog("已切换到新聊天，准备发送本轮 Prompt。");
+    await adapter.waitForComposerReady(Math.min(state.timeoutMs, 10000));
+    appendLog("输入框已就绪。");
 
     beforeSnapshot = adapter.getAssistantSnapshot();
 
@@ -652,7 +842,6 @@
 
     setStatus("waiting_stable");
     answer = await adapter.waitForStableAssistantAnswer({
-      stableMs: state.stableMs,
       timeoutMs: state.timeoutMs
     });
 
@@ -729,6 +918,10 @@
 
         syncUiFromState();
         await persistState();
+
+        appendLog("等待 3 秒后再切换到新聊天。");
+        await sleep(3000);
+        checkAbort();
 
         state.latestAnswer = await sendRawPromptAndCapture(state.nextPrompt);
         state.answerIndex += 1;
@@ -810,12 +1003,16 @@
     var latestMessage = this.getLatestMessage("assistant");
     var current = latestMessage;
     var depth = 0;
+    var fallbackScope = latestMessage;
 
     while (current && current !== document.body && depth < 8) {
+      if (!fallbackScope && current.querySelectorAll && current.querySelectorAll("button").length) {
+        fallbackScope = current;
+      }
+
       if (current.matches && (
         current.matches("article") ||
         current.matches('[data-testid="assistant-turn"]') ||
-        current.matches('[data-message-author-role="assistant"]') ||
         current.matches('[data-testid*="conversation-turn"]')
       )) {
         return current;
@@ -825,12 +1022,80 @@
       depth += 1;
     }
 
-    return latestMessage;
+    return fallbackScope;
+  };
+
+  ChatGPTDomAdapter.prototype.getLatestAssistantActionRoots = function () {
+    var latestMessage = this.getLatestMessage("assistant");
+    var roots = [];
+    var current = latestMessage;
+    var depth = 0;
+    var article = null;
+
+    function pushRoot(node) {
+      if (!node || roots.indexOf(node) >= 0 || (root && root.contains(node))) {
+        return;
+      }
+
+      roots.push(node);
+    }
+
+    if (!latestMessage) {
+      return [];
+    }
+
+    pushRoot(latestMessage);
+
+    while (current && current !== document.body && depth < 10) {
+      pushRoot(current);
+
+      if (!article && current.matches && current.matches("article")) {
+        article = current;
+      }
+
+      current = current.parentElement;
+      depth += 1;
+    }
+
+    if (!article && latestMessage.closest) {
+      article = latestMessage.closest("article");
+      pushRoot(article);
+    }
+
+    if (article && article.children) {
+      Array.prototype.slice.call(article.children).forEach(pushRoot);
+    }
+
+    if (latestMessage.parentElement && latestMessage.parentElement.children) {
+      Array.prototype.slice.call(latestMessage.parentElement.children).forEach(pushRoot);
+    }
+
+    return roots;
+  };
+
+  ChatGPTDomAdapter.prototype.getAssistantActionCandidates = function () {
+    var roots = this.getLatestAssistantActionRoots();
+    var candidates = [];
+
+    roots.forEach(function (scope) {
+      if (!scope || !scope.querySelectorAll) {
+        return;
+      }
+
+      Array.prototype.slice.call(scope.querySelectorAll("button")).forEach(function (button) {
+        if (candidates.indexOf(button) < 0) {
+          candidates.push(button);
+        }
+      });
+    });
+
+    return candidates;
   };
 
   ChatGPTDomAdapter.prototype.buttonLooksLikeCopyAction = function (button) {
     var testId = "";
     var label = "";
+    var copyReplyText = "\u590d\u5236\u56de\u590d";
 
     if (!button || !isVisible(button)) {
       return false;
@@ -847,35 +1112,136 @@
       return true;
     }
 
-    return label.indexOf("复制回复") >= 0 ||
-      label.indexOf("复制") >= 0 ||
-      label.indexOf("copy response") >= 0 ||
-      label.indexOf("copy reply") >= 0 ||
-      label.indexOf("copy") >= 0;
+    return label.indexOf(copyReplyText) >= 0;
   };
 
-  ChatGPTDomAdapter.prototype.latestAssistantHasCopyButton = function () {
-    var scope = this.getLatestAssistantActionScope();
-    var current = scope;
-    var depth = 0;
-    var buttons = [];
+  ChatGPTDomAdapter.prototype.buttonLooksLikeShareAction = function (button) {
+    var label = "";
+    var shareText = "\u5206\u4eab";
 
-    if (!scope) {
+    if (!button || !isVisible(button)) {
       return false;
     }
 
-    while (current && current !== document.body && depth < 6) {
-      buttons = current.querySelectorAll ? Array.prototype.slice.call(current.querySelectorAll("button")) : [];
+    label = normalizeText([
+      button.getAttribute("aria-label"),
+      button.getAttribute("title"),
+      button.innerText
+    ].join(" ")).toLowerCase();
 
-      if (buttons.some(this.buttonLooksLikeCopyAction.bind(this))) {
-        return true;
-      }
+    return label.indexOf(shareText) >= 0;
+  };
 
-      current = current.parentElement;
-      depth += 1;
+  ChatGPTDomAdapter.prototype.latestAssistantHasCopyButton = function () {
+    return this.getAssistantActionCandidates().some(this.buttonLooksLikeCopyAction.bind(this));
+  };
+
+  ChatGPTDomAdapter.prototype.findLatestAssistantCopyButton = function () {
+    var buttons = this.getAssistantActionCandidates();
+    var index = 0;
+
+    if (!buttons.length) {
+      return null;
     }
 
-    return false;
+    for (index = buttons.length - 1; index >= 0; index -= 1) {
+      if (this.buttonLooksLikeCopyAction(buttons[index])) {
+        return buttons[index];
+      }
+    }
+
+    return null;
+  };
+
+  ChatGPTDomAdapter.prototype.findLatestAssistantShareButton = function () {
+    var buttons = this.getAssistantActionCandidates();
+    var index = 0;
+
+    if (!buttons.length) {
+      return null;
+    }
+
+    for (index = buttons.length - 1; index >= 0; index -= 1) {
+      if (this.buttonLooksLikeShareAction(buttons[index])) {
+        return buttons[index];
+      }
+    }
+
+    return null;
+  };
+
+  ChatGPTDomAdapter.prototype.latestAssistantHasShareButton = function () {
+    return this.getAssistantActionCandidates().some(this.buttonLooksLikeShareAction.bind(this));
+  };
+
+  ChatGPTDomAdapter.prototype.describeButton = function (button) {
+    if (!button) {
+      return "none";
+    }
+
+    return [
+      "testId=" + (normalizeText(button.getAttribute("data-testid") || "") || "-"),
+      "label=" + (normalizeText([
+        button.getAttribute("aria-label"),
+        button.getAttribute("title"),
+        button.innerText
+      ].join(" ")) || "-"),
+      "class=" + (normalizeText(button.className || "") || "-").slice(0, 80)
+    ].join(", ");
+  };
+
+  ChatGPTDomAdapter.prototype.getLatestAssistantButtonDiagnostics = function () {
+    var roots = this.getLatestAssistantActionRoots();
+    var lines = [];
+
+    if (!roots.length) {
+      return "scope=none";
+    }
+
+    roots.slice(0, 8).forEach(function (scope, rootIndex) {
+      var buttons = [];
+      var scopeTag = normalizeText(scope.tagName || "").toLowerCase();
+      var scopeTestId = normalizeText(scope.getAttribute("data-testid") || "");
+      var scopeRole = normalizeText(scope.getAttribute("data-message-author-role") || "");
+      var scopeClass = normalizeText(scope.className || "");
+
+      if (!scope.querySelectorAll) {
+        lines.push("root#" + rootIndex + "{queryable=no}");
+        return;
+      }
+
+      buttons = Array.prototype.slice.call(scope.querySelectorAll("button"));
+
+      lines.push(
+        "root#" + rootIndex +
+        "{tag=" + scopeTag +
+        ", testId=" + (scopeTestId || "-") +
+        ", role=" + (scopeRole || "-") +
+        ", class=" + (scopeClass || "-").slice(0, 80) +
+        ", buttonCount=" + buttons.length +
+        "}"
+      );
+
+      buttons.slice(0, 6).forEach(function (button, buttonIndex) {
+        var label = normalizeText([
+          button.getAttribute("aria-label"),
+          button.getAttribute("title"),
+          button.innerText
+        ].join(" "));
+        var testId = normalizeText(button.getAttribute("data-testid") || "");
+
+        lines.push(
+          "r" + rootIndex + "b" + buttonIndex +
+          "{testId=" + (testId || "-") +
+          ", label=" + (label || "-") +
+          ", copy=" + (this.buttonLooksLikeCopyAction(button) ? "yes" : "no") +
+          ", share=" + (this.buttonLooksLikeShareAction(button) ? "yes" : "no") +
+          "}"
+        );
+      }, this);
+    }, this);
+
+    return lines.join(" | ");
   };
 
   ChatGPTDomAdapter.prototype.getAssistantSnapshot = function () {
@@ -930,16 +1296,189 @@
     for (outerIndex = 0; outerIndex < selectors.length; outerIndex += 1) {
       var nodes = this.queryAll(selectors[outerIndex]).filter(isVisible);
       if (nodes.length) {
-        return nodes[nodes.length - 1];
+        var candidate = nodes[nodes.length - 1];
+        var nestedComposer = null;
+
+        if (candidate.tagName === "TEXTAREA" || candidate.tagName === "INPUT" || candidate.isContentEditable) {
+          return candidate;
+        }
+
+        if (candidate.querySelector) {
+          nestedComposer = candidate.querySelector('textarea, input, div[contenteditable="true"]');
+          if (nestedComposer && isVisible(nestedComposer)) {
+            return nestedComposer;
+          }
+        }
       }
     }
 
     return null;
   };
 
+  ChatGPTDomAdapter.prototype.nodeLooksLikeNewChatTrigger = function (node) {
+    var testId = "";
+    var label = "";
+    var href = "";
+    var sidebarItem = "";
+    var newChatText = "\u65b0\u804a\u5929";
+
+    if (!node || !isVisible(node)) {
+      return false;
+    }
+
+    testId = normalizeText(node.getAttribute("data-testid") || "").toLowerCase();
+    label = normalizeText([
+      node.getAttribute("aria-label"),
+      node.getAttribute("title"),
+      node.innerText
+    ].join(" ")).toLowerCase();
+    href = normalizeText(node.getAttribute("href") || "").toLowerCase();
+    sidebarItem = normalizeText(node.getAttribute("data-sidebar-item") || "").toLowerCase();
+
+    if (testId === "create-new-chat-button") {
+      return true;
+    }
+
+    if (sidebarItem === "true" && href === "/" && (label.indexOf(newChatText) >= 0 || label.indexOf("new chat") >= 0)) {
+      return true;
+    }
+
+    if ((href === "/" || href.indexOf("/?") === 0) && sidebarItem === "true") {
+      return true;
+    }
+
+    if (testId.indexOf("new-chat") >= 0 || testId.indexOf("create-new-chat") >= 0) {
+      return true;
+    }
+
+    if (label.indexOf("新聊天") >= 0 || label.indexOf("new chat") >= 0) {
+      return true;
+    }
+
+    if ((href === "/" || href.indexOf("/?") === 0) && (label.indexOf("聊天") >= 0 || label.indexOf("chat") >= 0)) {
+      return true;
+    }
+
+    return false;
+  };
+
+  ChatGPTDomAdapter.prototype.findNewChatTrigger = function () {
+    var selectors = [
+      'button[data-testid*="new-chat"]',
+      'a[data-testid*="new-chat"]',
+      'button[aria-label*="新聊天"]',
+      'a[aria-label*="新聊天"]',
+      'button[aria-label*="New chat"]',
+      'a[aria-label*="New chat"]',
+      'aside button',
+      'aside a',
+      'nav button',
+      'nav a',
+      'button',
+      'a'
+    ];
+    var outerIndex = 0;
+
+    for (outerIndex = 0; outerIndex < selectors.length; outerIndex += 1) {
+      var nodes = this.queryAll(selectors[outerIndex]).filter(this.nodeLooksLikeNewChatTrigger.bind(this));
+      if (nodes.length) {
+        return nodes[0];
+      }
+    }
+
+    return null;
+  };
+
+  ChatGPTDomAdapter.prototype.waitForFreshChat = async function (beforeContext, timeoutMs) {
+    var startedAt = Date.now();
+
+    while (Date.now() - startedAt < timeoutMs) {
+      var composer = null;
+      var assistantCount = 0;
+      var userCount = 0;
+      var currentUrl = "";
+
+      checkAbort();
+
+      composer = this.findComposer();
+      assistantCount = this.getMessages("assistant").length;
+      userCount = this.getMessages("user").length;
+      currentUrl = window.location.pathname + window.location.search + window.location.hash;
+
+      if (composer && isVisible(composer) && assistantCount === 0 && userCount === 0) {
+        return;
+      }
+
+      if (composer && isVisible(composer) && currentUrl !== beforeContext.url && assistantCount === 0) {
+        return;
+      }
+
+      await sleep(250);
+    }
+
+    throw new Error("切换到新聊天超时。");
+  };
+
+  ChatGPTDomAdapter.prototype.openFreshChat = async function (timeoutMs) {
+    var trigger = null;
+    var beforeContext = {
+      url: window.location.pathname + window.location.search + window.location.hash,
+      assistantCount: this.getMessages("assistant").length,
+      userCount: this.getMessages("user").length
+    };
+
+    trigger = this.findNewChatTrigger();
+
+    if (!trigger) {
+      throw new Error("未找到“新聊天”按钮。");
+    }
+
+    trigger.click();
+    await this.waitForFreshChat(beforeContext, Math.min(timeoutMs, 15000));
+  };
+
+  ChatGPTDomAdapter.prototype.waitForComposerReady = async function (timeoutMs) {
+    var startedAt = Date.now();
+    var lastComposer = null;
+    var stableSince = 0;
+
+    while (Date.now() - startedAt < timeoutMs) {
+      var composer = this.findComposer();
+      var disabled = false;
+      var readOnly = false;
+
+      checkAbort();
+
+      if (composer && isVisible(composer)) {
+        disabled = composer.disabled === true || composer.getAttribute("aria-disabled") === "true";
+        readOnly = composer.readOnly === true || composer.getAttribute("readonly") !== null;
+
+        if (!disabled && !readOnly) {
+          if (composer === lastComposer) {
+            if (!stableSince) {
+              stableSince = Date.now();
+            }
+
+            if (Date.now() - stableSince >= 400) {
+              return composer;
+            }
+          } else {
+            lastComposer = composer;
+            stableSince = Date.now();
+          }
+        }
+      }
+
+      await sleep(120);
+    }
+
+    throw new Error("等待输入框就绪超时。");
+  };
+
   ChatGPTDomAdapter.prototype.fillComposer = function (text) {
     var composer = this.findComposer();
     var value = String(text || "");
+    var appliedValue = "";
 
     if (!composer) {
       throw new Error("未找到 ChatGPT 输入框。");
@@ -959,8 +1498,22 @@
         composer.value = value;
       }
 
-      composer.dispatchEvent(new Event("input", { bubbles: true }));
+      try {
+        composer.dispatchEvent(new InputEvent("input", {
+          bubbles: true,
+          data: value,
+          inputType: "insertText"
+        }));
+      } catch (inputError) {
+        composer.dispatchEvent(new Event("input", { bubbles: true }));
+      }
       composer.dispatchEvent(new Event("change", { bubbles: true }));
+      appliedValue = normalizeText(composer.value);
+
+      if (appliedValue !== normalizeText(value)) {
+        throw new Error("输入框写入后校验失败。expectedLen=" + value.length + ", actualLen=" + appliedValue.length);
+      }
+
       return composer;
     }
 
@@ -994,6 +1547,12 @@
       }
 
       composer.dispatchEvent(new Event("change", { bubbles: true }));
+      appliedValue = normalizeText(composer.textContent || composer.innerText || "");
+
+      if (appliedValue !== normalizeText(value)) {
+        throw new Error("内容编辑框写入后校验失败。expectedLen=" + value.length + ", actualLen=" + appliedValue.length);
+      }
+
       return composer;
     }
 
@@ -1026,25 +1585,83 @@
     return null;
   };
 
+  ChatGPTDomAdapter.prototype.submitComposerWithEnter = function () {
+    var composer = this.findComposer();
+    var beforeValue = "";
+    var keydown = null;
+    var keypress = null;
+    var keyup = null;
+
+    if (!composer) {
+      return false;
+    }
+
+    composer.focus();
+    beforeValue = normalizeText(composer.value || composer.textContent || composer.innerText || "");
+
+    keydown = new KeyboardEvent("keydown", {
+      key: "Enter",
+      code: "Enter",
+      keyCode: 13,
+      which: 13,
+      bubbles: true,
+      cancelable: true
+    });
+    keypress = new KeyboardEvent("keypress", {
+      key: "Enter",
+      code: "Enter",
+      keyCode: 13,
+      which: 13,
+      bubbles: true,
+      cancelable: true
+    });
+    keyup = new KeyboardEvent("keyup", {
+      key: "Enter",
+      code: "Enter",
+      keyCode: 13,
+      which: 13,
+      bubbles: true,
+      cancelable: true
+    });
+
+    composer.dispatchEvent(keydown);
+    composer.dispatchEvent(keypress);
+    composer.dispatchEvent(keyup);
+
+    return {
+      composer: composer,
+      beforeValue: beforeValue
+    };
+  };
+
   ChatGPTDomAdapter.prototype.clickSend = async function () {
     var startedAt = Date.now();
-    var timeoutMs = 8000;
-    var button = null;
+    var timeoutMs = 4000;
+    var submitResult = this.submitComposerWithEnter();
+
+    if (!submitResult) {
+      throw new Error("未找到 ChatGPT 输入框，无法模拟 Enter 发送。");
+    }
+
+    appendLog("已使用 Enter 模拟发送。");
 
     while (Date.now() - startedAt < timeoutMs) {
       checkAbort();
 
-      button = this.findSendButton();
-      if (button) {
-        button.click();
+      var currentComposer = this.findComposer();
+      var currentValue = currentComposer
+        ? normalizeText(currentComposer.value || currentComposer.textContent || currentComposer.innerText || "")
+        : "";
+
+      if (currentValue !== submitResult.beforeValue || currentValue === "") {
         await sleep(300);
         return;
       }
 
-      await sleep(200);
+      await sleep(120);
     }
 
-    throw new Error("未找到可点击的发送按钮。请确认输入框已填入内容，且 ChatGPT 页面允许发送。");
+    throw new Error("模拟 Enter 后输入框内容未变化，发送可能未生效。");
   };
 
   ChatGPTDomAdapter.prototype.waitForNewAssistant = async function (beforeSnapshot, timeoutMs) {
@@ -1079,35 +1696,43 @@
     var lastDiagnosticAt = 0;
     var lastDiagnosticKey = "";
 
-    appendLog("开始等待最新回答出现 copy 按钮。");
+    appendLog("开始等待最新回答同时出现 copy 按钮和分享按钮，并读取剪贴板。");
 
     while (Date.now() - startTime < timeoutMs) {
       checkAbort();
 
       var latestText = this.getLatestAssistantText();
       var latestHash = simpleHash(latestText);
-      var hasCopyButton = this.latestAssistantHasCopyButton();
+      var copyButton = this.findLatestAssistantCopyButton();
+      var shareButton = this.findLatestAssistantShareButton();
+      var hasCopyButton = Boolean(copyButton);
+      var hasShareButton = Boolean(shareButton);
       var diagnosticKey = "";
       var now = Date.now();
 
       if (latestText) {
-        if (hasCopyButton) {
-          appendLog("回答完成：最新回答已出现 copy 按钮。");
+        if (hasCopyButton && hasShareButton) {
+          appendLog("命中 copy 按钮：" + this.describeButton(copyButton));
+          appendLog("命中 share 按钮：" + this.describeButton(shareButton));
+          appendLog("回答完成：copy 按钮和分享按钮均已出现，回答正文改为直接从 DOM 提取。");
           return latestText;
         }
 
         diagnosticKey = [
           latestHash,
           latestText.length,
-          hasCopyButton ? "copy1" : "copy0"
+          hasCopyButton ? "copy1" : "copy0",
+          hasShareButton ? "share1" : "share0"
         ].join("|");
 
         if (diagnosticKey !== lastDiagnosticKey || now - lastDiagnosticAt >= 1500) {
           appendLog(
             "等待稳定：len=" + latestText.length +
             ", hash=" + latestHash +
-            ", copy=" + (hasCopyButton ? "yes" : "no")
+            ", copy=" + (hasCopyButton ? "yes" : "no") +
+            ", share=" + (hasShareButton ? "yes" : "no")
           );
+          appendLog("按钮诊断：" + this.getLatestAssistantButtonDiagnostics());
           lastDiagnosticKey = diagnosticKey;
           lastDiagnosticAt = now;
         }
@@ -1120,6 +1745,7 @@
   };
 
   async function init() {
+    installClipboardBridge();
     createPanel();
     bindPanelVisibilityEvents();
     adapter = new ChatGPTDomAdapter(root);

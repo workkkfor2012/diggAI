@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "DiggAI - ChatGPT Iteration Convergence",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "A Firefox WebExtension for iterative convergence prompting on chatgpt.com.",
   "permissions": [
     "storage"

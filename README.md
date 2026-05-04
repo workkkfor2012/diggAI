@@ -1,4 +1,4 @@
-# DiggAI v0.6.1
+# DiggAI v0.6.2
 
 DiggAI 是一个纯 Firefox WebExtension，会在 `chatgpt.com` 和 `chat.openai.com` 页面右侧注入控制面板，用于从原始提示词 A 一键开始自动迭代追问。
 
